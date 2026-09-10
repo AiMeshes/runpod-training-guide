@@ -546,7 +546,130 @@ runpodctl network-volume list            # 检查遗留 volume（隐性扣费源
 
 ---
 
-## 9. 针对你的场景：推荐配置总表
+## 9. 训练数据获取
+
+### 9.1 核心结论：传输完全免费
+
+- **HuggingFace 出网免费**（egress 与 CDN 均不计费）
+- **RunPod 入网免费**（ingress/egress 均无费用）
+
+> **推论：永远不要从 Mac 上传公共数据集。** 让 Pod 自己去拉。
+>
+> 家庭上行带宽是瓶颈：800GB 在 50 Mbps 上行下要传 **35 小时**；RunPod 机房用
+> `HF_HUB_ENABLE_HF_TRANSFER=1` 可跑到 ~300 MB/s（**约 45 分钟**）。差 45 倍。
+
+### 9.2 按数据规模选方案
+
+| 用途 | token 数 | 原始文本量¹ | 方案 |
+|---|---|---|---|
+| 微调 / LoRA / 后训练 / 64M 预训练 | < 13B | **< 50GB** | 启动脚本下载，容器盘够用 |
+| 350M 预训练 | 70B | ~280GB | 下载到 network volume |
+| midtraining | 10–50B | 40–200GB | 同上 |
+| **1B 预训练 (200×)** | 200B | **~800GB** | network volume + **预 tokenize** |
+
+¹ 按 ~4 bytes/token 估算（英文 UTF-8；中文 ~1.5 字/token × 3 bytes，量级相近）
+
+**大部分工作负载（微调 / LoRA / 后训练）数据量是 GB 级**，直接下载即可，无需特殊处理。
+真正需要设计的只有 1B 从头预训练那一档。
+
+### 9.3 推荐默认方案：entrypoint 幂等下载
+
+```bash
+# entrypoint.sh 的数据准备段
+DATA_DIR=/workspace/data
+
+if [ ! -f "$DATA_DIR/.ready" ]; then
+    export HF_HUB_ENABLE_HF_TRANSFER=1     # Rust 并行下载，快 5–10 倍
+    export HF_TOKEN=$HF_TOKEN              # 匿名访问会被限速，务必带 token
+
+    rm -rf "$DATA_DIR.tmp"
+    huggingface-cli download "$DATASET" \
+        --repo-type dataset --local-dir "$DATA_DIR.tmp"
+    mv "$DATA_DIR.tmp" "$DATA_DIR"         # 同分区 rename，原子
+    touch "$DATA_DIR/.ready"
+fi
+```
+
+三个设计点（与 §4.2 checkpoint 同一思路）：
+
+- **临时目录 + 原子 rename** —— 下载中途被抢占不会留下半份数据
+- **`.ready` 哨兵** —— 重启时跳过重复下载和 API 往返
+- **下到 `/workspace`（network volume）而非容器盘** —— 抢占后数据仍在
+
+`huggingface-cli download` 本身可续传（只补缺失文件），哨兵主要省每次启动的 API 查询。
+
+**hf_transfer 的两个坑：**
+
+- **快但断点续传弱**。800GB 在不稳定连接上断掉可能从头来。下到 network volume 可缓解（已完成文件保留）
+- **部分网络环境下多线程会失败**（有报告 2% 即卡住）。反复失败时 `unset HF_HUB_ENABLE_HF_TRANSFER` 退回单线程——慢但稳
+
+### 9.4 1B 级别：预 tokenize
+
+唯一需要额外工程的地方。200B tokens 每次重新 tokenize 是纯浪费——CPU 开销会成为数据加载
+瓶颈，而 GPU 在空转烧钱。
+
+收益：
+
+- 训练时**零 tokenization 开销**，memmap 顺序读可达 GB/s
+- 提前完成 **packing**（拼接 + 切定长），不在训练时现算
+- **数据顺序可复现**，checkpoint 恢复后分布一致
+
+**存储技巧**：vocab ≤ 65536 时用 **uint16** 存，200B tokens 从 800GB 降到 **400GB**，
+network volume 费用直接减半。现代 tokenizer 多为 128k vocab 需 uint32；若自训 tokenizer，
+控制在 64k 以内可省一半存储。
+
+> **在 CPU Pod 上做 tokenize，别占用 GPU Pod。** GPU 按秒计费，CPU 活儿不该烧 GPU 的钱。
+
+### 9.5 存储选择
+
+| 方案 | 价格 | 特性 |
+|---|---|---|
+| 容器盘 | $0.10/GB/月 | 停止即擦除，无需清理 |
+| **network volume** | **$0.07/GB/月** | 持久，**地域锁定** |
+| 流式（不落盘） | $0 | 每次重新拉，无随机访问 |
+
+800GB 的具体数字：容器盘 $80/月（仅运行期），network volume $56/月（持续计费）。
+
+> **network volume 每 GB-月更便宜，但必须记得删。** 训练完忘删就是每月 $56 白流走 —— 见 §5 的每周 `runpodctl get volume` 检查。
+
+**容器盘硬限制**：默认 20GB；CPU Pod 按 vCPU 自动分配（CPU3G/3C = vCPU×10GB，
+CPU5C = vCPU×15GB）。**800GB 这种量级必须用 network volume。**
+
+### 9.6 地域锁定陷阱
+
+**network volume 创建时须指定数据中心，之后不可迁移，且只有该机房的 GPU 能用它。**
+
+对 Spot 用户这是真实张力：spot GPU 在各机房的可用性随时变化，数据锁在没货的机房就只能干等。
+
+缓解办法正是 §9.1 的结论 —— **因为传输免费，你永远可以选择重新下载而非死等**：
+
+- **长期大项目** → 建 network volume，锁在 4090 供给最充足的机房
+- **短期实验** → 不建 volume，每次重新拉，保持机房选择自由
+
+### 9.7 自有数据：S3 兼容 API
+
+不在 HF 上的自有语料，可直接从 Mac 传到 network volume，**不用租 Pod 中转**：
+
+```bash
+# 先在 console → Settings → S3 API Keys 建独立密钥（区别于普通 API key）
+aws s3 cp ./corpus.tar.gz s3://$NETWORK_VOLUME_ID/ \
+    --endpoint-url https://s3api-us-ca-2.runpod.io \
+    --region US-CA-2 \
+    --cli-read-timeout 7200
+```
+
+- **bucket 名就是 network volume ID**，对象名直接映射文件系统路径
+- **region 就是机房 ID**，endpoint 为 `https://s3api-<机房>.runpod.io/`
+- **不额外计费**（只有存储费）
+- 当前支持 15 个机房（含 US-CA-2、US-NC-1、US-MO-1、EU-RO-1、EUR-IS-1 等）
+
+**限制**：不支持建桶/删桶、预签名 URL、ACL、版本控制；超 500MB 自动分片；
+**`aws s3 sync` 在大目录树上不可靠**（EOF / AccessDenied / 重复 token 错误），
+建议小批量 `cp`；文件数超 1 万时 `ls` 变慢；时钟偏差超 1 小时会被拒。
+
+---
+
+## 10. 针对你的场景：推荐配置总表
 
 | 工作负载 | 规模 | 推荐配置 | 预估成本 |
 |---|---|---|---|
@@ -568,7 +691,7 @@ runpodctl network-volume list            # 检查遗留 volume（隐性扣费源
 
 ---
 
-## 10. 行动清单
+## 11. 行动清单
 
 ### 立刻做
 1. **调低花费上限**，从默认 $80/hr 降到 $5/hr 量级
@@ -591,7 +714,7 @@ runpodctl network-volume list            # 检查遗留 volume（隐性扣费源
 
 ---
 
-## 11. 参考数字速查
+## 12. 参考数字速查
 
 ```
 有效 FLOPS（bf16，实际可达）
@@ -624,6 +747,12 @@ GPU-小时 = 6 × N × D / (有效FLOPS × 3600)
 - [RunPod Spot vs On-Demand — When the 50% Discount Is Worth the Interruption](https://ice-ice-bear.github.io/posts/2026-04-22-runpod-spot-vs-ondemand/)
 - [RunPod GPU Pricing: 2026 Comprehensive Pricing Guide](https://deploybase.ai/articles/runpod-gpu-pricing)
 
+**数据获取**
+- [RunPod S3 兼容 API（官方文档）](https://docs.runpod.io/storage/s3-api)
+- [HF 流式数据集（官方博客，中文）](https://huggingface.co/blog/zh/streaming-datasets)
+- [hf_transfer 集成说明](https://deepwiki.com/huggingface/hf_transfer/4.1-integration-with-huggingface_hub)
+- [HuggingFace 存储与计费](https://deepwiki.com/huggingface/hub-docs/7.2-billing-and-storage-management)
+
 **编排 / CI**
 - [runpodctl 官方仓库](https://github.com/runpod/runpodctl)
 - [runpodctl 概览（官方文档）](https://docs.runpod.io/runpodctl/overview)
@@ -633,4 +762,4 @@ GPU-小时 = 6 × N × D / (有效FLOPS × 3600)
 - [GitHub Actions Pricing 2026](https://toolradar.com/tools/github-actions/pricing)
 - [Mastering Disk Space on GitHub Actions Runners](https://www.geraldonit.com/mastering-disk-space-on-github-actions-runners-a-deep-dive-into-cleanup-strategies-for-x64-and-arm64-runners/)
 
-> 本文所有成本为估算，基于 §11 的假设。实际差异可能达 2 倍。**跑 500 步实测再外推。**
+> 本文所有成本为估算，基于 §12 的假设。实际差异可能达 2 倍。**跑 500 步实测再外推。**
