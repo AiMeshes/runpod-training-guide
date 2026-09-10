@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# RunPod / 训练产物
+*.tar.gz
+*.pt
+*.safetensors
+checkpoints/
+runs/
+wandb/
+.env
