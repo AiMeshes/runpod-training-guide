@@ -752,7 +752,72 @@ Mac ──境内快──> 国内 OSS ──?──> RunPod
 
 ---
 
-## 11. 行动清单
+## 11. 落地参考：minimind + RunPod 外壳
+
+[minimind](https://github.com/jingyaogong/minimind)（64M–1B 从头训练，Apache-2.0）的 `trainer/`
+目录正好覆盖本文档的全部分阶段目标，可以直接作为落地起点。
+
+配套外壳：[AiMeshes/minimind-runpod](https://github.com/AiMeshes/minimind-runpod)
+—— **不改动 minimind 一行代码**，靠目录约定实现持久化。
+
+### 11.1 外壳能很薄，因为 minimind 自带了这些
+
+| 能力 | 位置 | 意义 |
+|---|---|---|
+| **原子写 checkpoint** | `trainer_utils.py:74-76` | `.tmp` + `os.replace`，正是 §4.2 建议的做法 |
+| **`--from_resume 1`** | `train_pretrain.py:104` | 自动找最新 checkpoint 续训 |
+| **GPU 数自适应** | `trainer_utils.py:110-114` | ⭐ 卡数变化时自动换算 step |
+| **确定性 shuffle** | `train_pretrain.py:160` | `seed + epoch` 播种，恢复后数据顺序一致 |
+
+**第 3 条对 Spot 尤其关键**：8 卡被抢占后重开的机器可能只有 4 卡甚至 1 卡，
+minimind 能直接接上继续训，不需要任何改造——这是多数训练框架没有的能力。
+
+**同时修正 §4.2 的一条建议**：那里说"必须保存数据迭代器位置"。
+在 minimind 中**不需要**——它的 shuffle 是种子确定性的，配合 `SkipBatchSampler`
+跳过已消费 batch，恢复后数据顺序天然一致。那条建议对通用框架成立，对 minimind 是多余的。
+
+### 11.2 持久化的关键：目录约定而非改代码
+
+`train_pretrain.py:69,118` 中 `save_dir='../checkpoints'` 是**硬编码**的，
+且 minimind 约定**从 `trainer/` 目录内运行**（所以还有 `../out`、`../model`、`../dataset`）。
+
+于是只要整体放在 network volume 上，checkpoint 就自动持久化：
+
+```
+/workspace/                      ← network volume 挂载点
+└── minimind/
+    ├── trainer/                 ← 从这里运行
+    ├── dataset/
+    ├── checkpoints/             ← '../checkpoints' 解析到此 ← 持久化
+    └── out/
+```
+
+**这是 wrap 优于 patch 的具体体现**：上游改 `train_pretrain.py` 的任何内容都不影响这层约定。
+
+### 11.3 为什么是外壳而不是 fork 改造
+
+minimind 上游非常活跃（60k stars，几乎每天有 commit）。直接改 `trainer/*.py` 会让每次
+同步上游都在处理合并冲突；外壳模式下上游改了什么都不影响你。
+
+| 方案 | 上游同步 | 适用 |
+|---|---|---|
+| submodule | 干净 | 不修改代码 |
+| subtree | 冲突多 | 不修改代码、要单次 clone |
+| fork 改造 | 冲突多 | 修改核心逻辑 |
+| **外壳 wrap** | **干净** | **只加运行层 ← 推荐** |
+
+### 11.4 基础镜像已核实
+
+`runpod/pytorch:1.1.0-cu1281-torch260-ubuntu2204`：Python 3.12 / torch 2.6.0 /
+CUDA 12.8.1 / 10.6GB。
+
+> **该镜像已预设 `HF_HUB_ENABLE_HF_TRANSFER=1`**（§9.3 建议的并行下载开箱即用），
+> 但**同时把 `HF_HOME` 指向 `/workspace/.cache/huggingface/`** —— 即 network volume。
+> **HF 缓存会常驻并计费（$0.07/GB/月）**，不需要跨 pod 复用时记得清理或改到容器盘。
+
+---
+
+## 12. 行动清单
 
 ### 立刻做
 1. **调低花费上限**，从默认 $80/hr 降到 $5/hr 量级
@@ -775,7 +840,7 @@ Mac ──境内快──> 国内 OSS ──?──> RunPod
 
 ---
 
-## 12. 参考数字速查
+## 13. 参考数字速查
 
 ```
 有效 FLOPS（bf16，实际可达）
@@ -827,4 +892,4 @@ GPU-小时 = 6 × N × D / (有效FLOPS × 3600)
 - [GitHub Actions Pricing 2026](https://toolradar.com/tools/github-actions/pricing)
 - [Mastering Disk Space on GitHub Actions Runners](https://www.geraldonit.com/mastering-disk-space-on-github-actions-runners-a-deep-dive-into-cleanup-strategies-for-x64-and-arm64-runners/)
 
-> 本文所有成本为估算，基于 §12 的假设。实际差异可能达 2 倍。**跑 500 步实测再外推。**
+> 本文所有成本为估算，基于 §13 的假设。实际差异可能达 2 倍。**跑 500 步实测再外推。**

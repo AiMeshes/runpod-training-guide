@@ -77,6 +77,17 @@
 
 ---
 
+## 配套项目
+
+| 项目 | 说明 |
+|---|---|
+| **[minimind-runpod](https://github.com/AiMeshes/minimind-runpod)** | 给 [minimind](https://github.com/jingyaogong/minimind) 套的 RunPod 运行外壳：抗抢占 checkpoint、supervisor 自动续训、network volume 持久化。**不改动 minimind 一行代码** |
+| **[AiMeshes/minimind](https://github.com/AiMeshes/minimind)** | minimind 的 fork，用于同步上游 |
+
+minimind 正好覆盖本文档的目标区间（`trainer/` 内含 `train_pretrain` / `train_full_sft` / `train_lora` / `train_dpo` / `train_ppo` / `train_grpo` / `train_distillation`），它自带的原子写 checkpoint、`--from_resume`、GPU 数自适应三项能力让外壳可以很薄。
+
+---
+
 ## 立刻要做的三件事
 
 1. **调低花费上限**：账户设置里从默认 $80/hr 降到 $5/hr 量级
@@ -97,10 +108,11 @@
 | §7 | **Spot vs Secure 决策阈值** |
 | §8 | **编排架构**：需不需要 CI、代码/镜像传递、恢复方案 |
 | §9 | **训练数据获取**：HF 下载、预 tokenize、S3 API、地域锁定、跨境搬运 |
-| §10–12 | 推荐配置总表、行动清单、速查公式 |
+| §10–11 | 推荐配置总表、minimind 落地参考 |
+| §12–13 | 行动清单、速查公式 |
 
 ---
 
 ## 免责声明
 
-本文所有成本为**估算**，基于文档 §12 的假设（bf16、FlashAttention-2、真实可达 MFU）。实际差异可能达 2 倍。**跑 500 步实测再外推。**
+本文所有成本为**估算**，基于文档 §13 的假设（bf16、FlashAttention-2、真实可达 MFU）。实际差异可能达 2 倍。**跑 500 步实测再外推。**
