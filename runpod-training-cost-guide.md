@@ -817,7 +817,35 @@ minimind 上游非常活跃（60k stars，几乎每天有 commit）。直接改 
 | fork 改造 | 冲突多 | 修改核心逻辑 |
 | **外壳 wrap** | **干净** | **只加运行层 ← 推荐** |
 
-### 11.4 基础镜像已核实
+### 11.4 ⚠️ 必须用 REST API —— SDK 建不出 Spot Pod
+
+**已用真实凭据核实**：`runpod` Python SDK 1.12.0（当前最新版）的 `create_pod`
+**没有任何 spot 相关参数** —— 整个包里搜不到 `interruptible` / `max_bid_price` / `SPOT`。
+
+而 REST 的 `POST https://rest.runpod.io/v1/pods` 支持 `"interruptible": true`。
+
+> **用 SDK 就只能按需付费，成本翻倍。** 对 §3 里那些 $1,000+ 的训练，
+> 这是 $1,000 量级的差别 —— 而且不会报错，只是账单变成两倍。
+
+两套 API 的字段格式**完全不同**，不能混用：
+
+| | SDK `create_pod` | REST `POST /v1/pods` |
+|---|---|---|
+| 命名 | `snake_case` | `camelCase` |
+| 环境变量 | `env=[{key,value}]` | `env={k: v}` **对象** |
+| 端口 | 字符串 `"8888/http"` | **数组** |
+| GPU | `gpu_type_id`（单个） | `gpuTypeIds`（**数组**） |
+| Spot | ✗ | `interruptible: true` |
+
+**字段名以 OpenAPI spec 为准**：`https://rest.runpod.io/v1/openapi.json`
+（可匿名访问，154KB，含全部 33 个合法字段与枚举）。
+
+> **另一个会静默失效的坑**：REST 的 `desiredStatus` 合法值是
+> **`RUNNING` / `EXITED` / `TERMINATED`**，**没有 `STOPPED`**。
+> 被抢占后是 `EXITED`（可 `POST /pods/{id}/start` 恢复），`TERMINATED` 是彻底删除。
+> 监控脚本若按 `STOPPED` 判断，**抢占后永远不会触发恢复**，训练就此停摆。
+
+### 11.5 基础镜像已核实
 
 `runpod/pytorch:1.1.0-cu1281-torch260-ubuntu2204`：Python 3.12 / torch 2.6.0 /
 CUDA 12.8.1 / 10.6GB。
