@@ -667,6 +667,67 @@ aws s3 cp ./corpus.tar.gz s3://$NETWORK_VOLUME_ID/ \
 **`aws s3 sync` 在大目录树上不可靠**（EOF / AccessDenied / 重复 token 错误），
 建议小批量 `cp`；文件数超 1 万时 `ls` 变慢；时钟偏差超 1 小时会被拒。
 
+### 9.8 对象存储与跨境搬运
+
+**国内对象存储的公网流出定价高度一致，没有便宜的。**
+
+| 服务 | 公网流出 | 标准存储 | 免费额度 | 可用性 |
+|---|---|---|---|---|
+| 阿里云 OSS | **¥0.5/GB**（闲时 ¥0.25） | ¥0.12/GB/月 | 仅新用户试用 | ✅ |
+| 腾讯云 COS | **¥0.5/GB** | ¥0.118/GB/月 | 无 | ✅ |
+| 火山引擎 TOS | ~¥0.5/GB | 相近 | 仅试用 | ✅ |
+| 七牛云 | 阶梯 | — | 10GB + 10GB/月 | ❌ |
+| 又拍云 | 阶梯 | — | 10GB + 15GB/月 | ❌ |
+| **Cloudflare R2** | **$0** | $0.015/GB/月 ≈ ¥0.11 | 10GB | ⭐ 非国内 |
+
+**七牛 / 又拍的免费额度（10–15GB）对预训练没有意义** —— 那是图床和博客的量级。
+
+国内两个压价技巧：
+
+- **闲时计费**：阿里云 00:00–08:00 流量半价 **¥0.25/GB**
+- **CDN 回源**：**¥0.15/GB**（需配 CDN，回源仍走同一跨境链路）
+
+800GB 的账：忙时 **¥400** / 闲时 **¥200** / CDN 回源 **¥120**。
+
+> **但流量费不是主要成本。** 800GB 一次性 ¥400（~$55）；若传输期间 GPU 在跑，
+> 3 天闲置就是 **$500+**。**相比 GPU 闲置费，流量费便宜近 10 倍。**
+
+#### 关键：让传输发生在没有 GPU 计费的时候
+
+**RunPod network volume 独立于 Pod 存在**，可用 S3 兼容 API 直接读写：
+
+```
+Mac ──(RunPod S3 API)──> network volume     ← 全程无需 GPU 运行
+```
+
+传输期间只有存储费，没有 GPU 费。**§9.1 的"让 Pod 自己拉"只适用于 Pod 侧能高速访问的源**
+（HF / R2）；对 ModelScope 这类跨境慢源，正确的做法是预加载 network volume 而不是让 GPU 等。
+
+#### 国内 OSS 在中转链中的位置
+
+价值有限 —— 只是多一跳，最终仍要跨境：
+
+```
+Mac ──境内快──> 国内 OSS ──?──> RunPod
+                            ↑ 这一跳是问题
+```
+
+第二跳需要有人拉：GPU Pod 拉（烧 GPU）/ CPU Pod 拉（便宜但慢）/ RunPod S3 API 无法拉外部 URL。
+
+> **阿里云"传输加速"** 走其全球骨干网优化跨境，但额外收费，价格未核实。
+
+（**内网流量免费**只适用于同云内部，对跨境到 RunPod 无效。）
+
+#### 决策顺序
+
+1. **可公开 → HuggingFace 公开 repo**：免费、无硬上限、RunPod 侧同区域 CDN 最快。
+   预训练语料大多本就公开，这是最优解。
+2. **必须私有 → Cloudflare R2**：零流量费 + 全球 CDN（RunPod 侧快）+ 存储 ¥0.11/GB/月。
+3. **强制国内 → 阿里云 OSS 闲时**（¥0.25/GB），任务排在 00:00–08:00。
+
+> ⚠️ **未验证**：R2 从中国大陆上传的实际速度与稳定性无可靠数据，Cloudflare 国内访问质量波动。
+> **传 1GB 实测即可确认**，成本几乎为零。不通则退回方案 3。
+
 ---
 
 ## 10. 针对你的场景：推荐配置总表
@@ -749,6 +810,10 @@ GPU-小时 = 6 × N × D / (有效FLOPS × 3600)
 
 **数据获取**
 - [RunPod S3 兼容 API（官方文档）](https://docs.runpod.io/storage/s3-api)
+- [Cloudflare R2 定价（官方文档）](https://developers.cloudflare.com/r2/pricing/)
+- [阿里云 OSS 与腾讯云 COS 价格对比](https://heng666.cn/posts/2026-07-29-aliyun-oss-oss-vs-cos-price-compare.html)
+- [七牛云免费额度说明（官方）](https://developer.qiniu.com/af/kb/1574/free-credit-information)
+- [火山引擎 TOS 资源包概述（官方）](https://docs.volcengine.com/docs/6349/178341)
 - [HF 流式数据集（官方博客，中文）](https://huggingface.co/blog/zh/streaming-datasets)
 - [hf_transfer 集成说明](https://deepwiki.com/huggingface/hf_transfer/4.1-integration-with-huggingface_hub)
 - [HuggingFace 存储与计费](https://deepwiki.com/huggingface/hub-docs/7.2-billing-and-storage-management)
